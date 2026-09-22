@@ -1,0 +1,19 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local fetch output, including a database chosen outside data/
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Optional Netscape cookie file passed to --cookies
+cookies.txt

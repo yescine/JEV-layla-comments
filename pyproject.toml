@@ -1,0 +1,19 @@
+[project]
+name = "jev-layla-comments"
+version = "0.1.0"
+description = "Fetch 500px gallery and photo metadata from a source URL list"
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.32.3",
+]
+
+[project.scripts]
+fivehundredpx-fetch = "fivehundredpx.fivehundredpx_fetch:main"
+
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["fivehundredpx"]
+package-dir = { fivehundredpx = "500px" }
