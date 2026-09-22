@@ -245,6 +245,7 @@ def reset_selected_comments(db: sqlite3.Connection) -> None:
     selected = """photo_id IN (
         SELECT photo_id FROM source_photos WHERE source_url IN (SELECT url FROM selected_sources))"""
     with db:
+        db.execute(f"DELETE FROM comment_scores WHERE comment_id IN (SELECT id FROM comments WHERE {selected})")
         db.execute(f"DELETE FROM comment_cursors WHERE {selected}")
         db.execute(f"DELETE FROM comments WHERE {selected}")
         db.execute(f"DELETE FROM comment_fetches WHERE {selected}")

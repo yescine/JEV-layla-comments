@@ -1,14 +1,18 @@
 [project]
 name = "jev-layla-comments"
 version = "0.1.0"
-description = "Fetch 500px gallery and photo metadata from a source URL list"
+description = "Fetch 500px gallery and photo metadata, then score comments with Laya"
 requires-python = ">=3.11"
 dependencies = [
     "requests>=2.32.3",
 ]
 
+[project.optional-dependencies]
+score = ["laya>=0.3.5"]
+
 [project.scripts]
 fivehundredpx-fetch = "fivehundredpx.fivehundredpx_fetch:main"
+fivehundredpx-score = "fivehundredpx.score_comments:main"
 
 [build-system]
 requires = ["setuptools>=70"]

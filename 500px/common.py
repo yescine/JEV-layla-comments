@@ -146,6 +146,15 @@ def open_database(path: Path) -> sqlite3.Connection:
             photo_id TEXT NOT NULL REFERENCES photos(id), cursor TEXT NOT NULL,
             PRIMARY KEY (photo_id, cursor)
         );
+        CREATE TABLE IF NOT EXISTS comment_scores (
+            comment_id TEXT PRIMARY KEY REFERENCES comments(id) ON DELETE CASCADE,
+            schema_version TEXT NOT NULL,
+            model TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            answers_json TEXT NOT NULL,
+            error TEXT,
+            scored_at TEXT NOT NULL
+        );
     """)
     return db
 
