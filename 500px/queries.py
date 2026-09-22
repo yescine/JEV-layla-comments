@@ -1,6 +1,7 @@
-"""500px public website GraphQL selections, verified on 2026-09-11.
+"""500px public website GraphQL selections.
 
-Source: the site's getPhotoById.generated and gallery component documents.
+Photo and gallery fields verified on 2026-09-11. pageComments verified on 2026-09-22.
+Source: the site's getPhotoById.generated, gallery, and pageComments documents.
 Image URLs are signed renditions; preserve the complete values verbatim.
 """
 
@@ -69,3 +70,47 @@ query GroupPhotos($groupId: ID!) {
   getPhotosByGroupId(groupId: $groupId) { ...PhotoMetadata }
 }
 """ + PHOTO_FRAGMENT
+
+# Replies are nested on each top-level comment. There is no separate reply page.
+COMMENTS_QUERY = """
+query pageComments($resourceId: ID!, $resourceType: CommentResourceType!, $first: Int!, $after: String) {
+  pageComments(resourceId: $resourceId, resourceType: $resourceType, first: $first, after: $after) {
+    edges {
+      node {
+        ...CommentFragment
+        replies { ...CommentFragment }
+      }
+    }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+
+fragment CommentFragment on Comment {
+  id
+  resourceType
+  resource {
+    ... on Photo { id }
+    ... on PhotoGroup { id }
+    ... on Video { id }
+    ... on Gallery { id }
+  }
+  content
+  createdAt
+  createdLocation
+  creator {
+    id username displayName avatar
+    membership { membership }
+  }
+  photoUrls { small medium isAigc }
+  replyToUser { id username displayName }
+  mentionedUsers { id username displayName }
+  replyCount
+  isLikedByMe
+  likeCount
+  language
+  parentId
+  isSecondaryReply
+  isHidden
+  isInReview
+}
+"""

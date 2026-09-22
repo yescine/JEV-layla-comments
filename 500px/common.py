@@ -125,6 +125,27 @@ def open_database(path: Path) -> sqlite3.Connection:
             photo_id TEXT PRIMARY KEY REFERENCES photos(id), status TEXT NOT NULL,
             path TEXT, bytes INTEGER, error TEXT, updated_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS comments (
+            id TEXT PRIMARY KEY,
+            photo_id TEXT NOT NULL REFERENCES photos(id),
+            parent_id TEXT,
+            content TEXT NOT NULL,
+            language TEXT,
+            created_at TEXT,
+            creator_id TEXT,
+            metadata_json TEXT NOT NULL,
+            fetched_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS comments_by_photo ON comments(photo_id);
+        CREATE TABLE IF NOT EXISTS comment_fetches (
+            photo_id TEXT PRIMARY KEY REFERENCES photos(id),
+            cursor TEXT, complete INTEGER NOT NULL DEFAULT 0,
+            pages INTEGER NOT NULL DEFAULT 0, error TEXT, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS comment_cursors (
+            photo_id TEXT NOT NULL REFERENCES photos(id), cursor TEXT NOT NULL,
+            PRIMARY KEY (photo_id, cursor)
+        );
     """)
     return db
 

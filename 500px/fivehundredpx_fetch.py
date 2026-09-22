@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect 500px gallery/photo metadata; never download image bodies."""
+"""Collect 500px gallery/photo metadata and comments; never download image bodies."""
 
 from __future__ import annotations
 
@@ -15,12 +15,12 @@ try:
     from .common import (DEFAULT_DATABASE, GraphQLClient, GraphQLError, export_jsonl,
                          non_negative_float, non_negative_int, open_database,
                          parse_source, positive_float, positive_int, read_sources, utc_now)
-    from .queries import ENDPOINT, GALLERY_QUERY, GROUP_QUERY, PHOTO_QUERY
+    from .queries import COMMENTS_QUERY, ENDPOINT, GALLERY_QUERY, GROUP_QUERY, PHOTO_QUERY
 except ImportError:
     from common import (DEFAULT_DATABASE, GraphQLClient, GraphQLError, export_jsonl,
                         non_negative_float, non_negative_int, open_database,
                         parse_source, positive_float, positive_int, read_sources, utc_now)
-    from queries import ENDPOINT, GALLERY_QUERY, GROUP_QUERY, PHOTO_QUERY
+    from queries import COMMENTS_QUERY, ENDPOINT, GALLERY_QUERY, GROUP_QUERY, PHOTO_QUERY
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -48,6 +48,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--retry-backoff", type=non_negative_float, default=1)
     parser.add_argument("--delay", type=non_negative_float, default=0.5,
                         help="Minimum seconds between GraphQL requests")
+    parser.add_argument("--no-comment", action="store_true",
+                        help="Skip photo comments. Comments are fetched by default.")
     parser.add_argument("--cookies", type=Path, help="Optional explicitly exported Netscape cookie file")
     parser.add_argument("--export-jsonl", type=Path,
                         help="Stream all saved photo metadata to this file after fetching")
@@ -216,6 +218,202 @@ def fetch_source(db: sqlite3.Connection, client: GraphQLClient, source: sqlite3.
     return count
 
 
+def valid_id(value: object) -> bool:
+    return (isinstance(value, str) and bool(value) and value.isascii()
+            and all(c.isalnum() or c in "_-" for c in value))
+
+
+def photo_has_comments(metadata_json: str) -> bool:
+    """False only when the saved photo metadata says the thread is empty."""
+    try:
+        meta = json.loads(metadata_json)
+    except json.JSONDecodeError:
+        return True
+    if meta.get("hasComment") is True:
+        return True
+    count = meta.get("commentCount")
+    if type(count) is int:
+        return count > 0
+    return True
+
+
+def reset_selected_comments(db: sqlite3.Connection) -> None:
+    """Drop comment checkpoints for the selected sources so a refresh refetches them."""
+    selected = """photo_id IN (
+        SELECT photo_id FROM source_photos WHERE source_url IN (SELECT url FROM selected_sources))"""
+    with db:
+        db.execute(f"DELETE FROM comment_cursors WHERE {selected}")
+        db.execute(f"DELETE FROM comments WHERE {selected}")
+        db.execute(f"DELETE FROM comment_fetches WHERE {selected}")
+
+
+def parse_comments_page(data: dict, photo_id: str) -> tuple[list[dict], str | None, bool]:
+    connection = data.get("pageComments")
+    if not isinstance(connection, dict):
+        raise GraphQLError("Comments unavailable or pageComments missing")
+    edges, info = connection.get("edges"), connection.get("pageInfo")
+    if not isinstance(edges, list) or not isinstance(info, dict) or type(info.get("hasNextPage")) is not bool:
+        raise GraphQLError("Malformed comment pagination response")
+    complete = not info["hasNextPage"]
+    cursor = info.get("endCursor")
+    if cursor is not None and (not isinstance(cursor, str) or not cursor):
+        raise GraphQLError("Invalid comment endCursor")
+    if not complete and (not cursor or not edges):
+        raise GraphQLError("Comments claim another page without edges or cursor")
+    comments = []
+    for edge in edges:
+        if not isinstance(edge, dict) or not isinstance(edge.get("node"), dict):
+            raise GraphQLError("Malformed comment; page checkpoint preserved")
+        node = edge["node"]
+        replies = node.get("replies")
+        if replies is None:
+            replies = []
+        if not isinstance(replies, list) or any(not isinstance(reply, dict) for reply in replies):
+            raise GraphQLError("Malformed comment replies; page checkpoint preserved")
+        # replyCount can exceed this list: the website field is not paginated and omits some replies.
+        parent = dict(node)
+        parent.pop("replies", None)
+        comments.append(parent)
+        for reply in replies:
+            reply = dict(reply)
+            if reply.get("parentId") is None:
+                reply["parentId"] = parent.get("id")
+            comments.append(reply)
+    for comment in comments:
+        if not valid_id(comment.get("id")):
+            raise GraphQLError("Comment has no string ID; page checkpoint preserved")
+        if not isinstance(comment.get("content"), str):
+            raise GraphQLError("Comment content must be a string; page checkpoint preserved")
+        parent_id = comment.get("parentId")
+        if parent_id is not None and not valid_id(parent_id):
+            raise GraphQLError("Comment parentId is invalid; page checkpoint preserved")
+        if comment.get("resourceType") not in {None, "PHOTO"}:
+            raise GraphQLError(f"Unsupported comment resource: {comment.get('resourceType')}")
+        resource = comment.get("resource")
+        if isinstance(resource, dict) and resource.get("id") not in {None, photo_id}:
+            raise GraphQLError("Comment resource does not match the photo; page checkpoint preserved")
+        creator = comment.get("creator")
+        if creator is not None and not isinstance(creator, dict):
+            raise GraphQLError("Comment creator must be an object; page checkpoint preserved")
+        if isinstance(creator, dict) and creator.get("id") is not None and not valid_id(creator.get("id")):
+            raise GraphQLError("Comment creator has no string ID; page checkpoint preserved")
+        if comment.get("language") is not None and not isinstance(comment.get("language"), str):
+            raise GraphQLError("Comment language must be a string; page checkpoint preserved")
+        if comment.get("createdAt") is not None and not isinstance(comment.get("createdAt"), str):
+            raise GraphQLError("Comment createdAt must be a string; page checkpoint preserved")
+    return comments, cursor, complete
+
+
+def save_comments(db: sqlite3.Connection, photo_id: str, comments: list[dict],
+                  next_cursor: str | None, complete: bool) -> int:
+    """Commit one comment page and its cursor together, or none of it."""
+    now = utc_now()
+    with db:
+        for comment in comments:
+            creator = comment.get("creator") if isinstance(comment.get("creator"), dict) else {}
+            db.execute("""
+                INSERT INTO comments(
+                    id, photo_id, parent_id, content, language, created_at, creator_id, metadata_json, fetched_at
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET photo_id=excluded.photo_id, parent_id=excluded.parent_id,
+                    content=excluded.content, language=excluded.language, created_at=excluded.created_at,
+                    creator_id=excluded.creator_id, metadata_json=excluded.metadata_json,
+                    fetched_at=excluded.fetched_at
+            """, (comment["id"], photo_id, comment.get("parentId"), comment["content"], comment.get("language"),
+                  comment.get("createdAt"), creator.get("id"), json.dumps(comment, ensure_ascii=False), now))
+        if next_cursor is not None:
+            try:
+                db.execute("INSERT INTO comment_cursors VALUES (?,?)", (photo_id, next_cursor))
+            except sqlite3.IntegrityError as exc:
+                raise GraphQLError("Comments repeated a pagination cursor; page checkpoint preserved") from exc
+        db.execute("""
+            INSERT INTO comment_fetches(photo_id, cursor, complete, pages, error, updated_at)
+            VALUES (?, ?, ?, 1, NULL, ?)
+            ON CONFLICT(photo_id) DO UPDATE SET cursor=excluded.cursor, complete=excluded.complete,
+                pages=comment_fetches.pages+1, error=NULL, updated_at=excluded.updated_at
+        """, (photo_id, next_cursor, int(complete), now))
+    return len(comments)
+
+
+def mark_comments_complete(db: sqlite3.Connection, photo_id: str) -> None:
+    with db:
+        db.execute("""
+            INSERT INTO comment_fetches(photo_id, cursor, complete, pages, error, updated_at)
+            VALUES (?, NULL, 1, 0, NULL, ?)
+            ON CONFLICT(photo_id) DO UPDATE SET complete=1, error=NULL, updated_at=excluded.updated_at
+        """, (photo_id, utc_now()))
+
+
+def record_comment_error(db: sqlite3.Connection, photo_id: str, message: str) -> None:
+    with db:
+        db.execute("""
+            INSERT INTO comment_fetches(photo_id, cursor, complete, pages, error, updated_at)
+            VALUES (?, NULL, 0, 0, ?, ?)
+            ON CONFLICT(photo_id) DO UPDATE SET error=excluded.error, updated_at=excluded.updated_at
+        """, (photo_id, message[:1000], utc_now()))
+
+
+def fetch_photo_comments(db: sqlite3.Connection, client: GraphQLClient, photo_id: str, metadata_json: str,
+                         *, page_size: int, verbose: int = 0) -> int:
+    state = db.execute("SELECT * FROM comment_fetches WHERE photo_id=?", (photo_id,)).fetchone()
+    if state is not None and state["complete"]:
+        return 0
+    if (state is None or (state["pages"] == 0 and state["cursor"] is None)) and not photo_has_comments(metadata_json):
+        mark_comments_complete(db, photo_id)
+        if verbose:
+            print(f"{photo_id}: no comments", flush=True)
+        return 0
+    pages = 0
+    count = 0
+    cursor = state["cursor"] if state is not None else None
+    while True:
+        try:
+            data = client.query(COMMENTS_QUERY, {
+                "resourceId": photo_id, "resourceType": "PHOTO", "first": page_size, "after": cursor,
+            })
+        except GraphQLError as exc:
+            raise GraphQLError(f"Comment page {pages + 1} failed (after={cursor!r}, page_size={page_size}): {exc}") from exc
+        comments, next_cursor, complete = parse_comments_page(data, photo_id)
+        if next_cursor is not None and next_cursor == cursor:
+            raise GraphQLError("Comment cursor did not advance; page checkpoint preserved")
+        count += save_comments(db, photo_id, comments, next_cursor, complete)
+        pages += 1
+        cursor = next_cursor
+        if verbose or pages % 10 == 0 or complete:
+            print(f"{photo_id}: {pages} comment page(s) this run, {count} comment(s), "
+                  f"{'complete' if complete else 'checkpoint saved'}", flush=True)
+        if complete:
+            break
+    return count
+
+
+def fetch_selected_comments(db: sqlite3.Connection, client: GraphQLClient, *,
+                            page_size: int, verbose: int = 0) -> int:
+    """Fetch comments for photos already linked to the selected sources. Failures stay per photo."""
+    failures = 0
+    last_id = ""
+    while True:
+        photo = db.execute("""
+            SELECT p.id, p.metadata_json FROM photos p
+            JOIN source_photos sp ON sp.photo_id = p.id
+            JOIN selected_sources sel ON sel.url = sp.source_url
+            LEFT JOIN comment_fetches cf ON cf.photo_id = p.id
+            WHERE p.id > ? AND COALESCE(cf.complete, 0) = 0
+            GROUP BY p.id ORDER BY p.id LIMIT 1
+        """, (last_id,)).fetchone()
+        if photo is None:
+            break
+        last_id = photo["id"]
+        try:
+            fetch_photo_comments(db, client, photo["id"], photo["metadata_json"],
+                                 page_size=page_size, verbose=verbose)
+        except (GraphQLError, ValueError, requests.RequestException) as exc:
+            failures += 1
+            record_comment_error(db, photo["id"], str(exc))
+            print(f"ERROR {photo['id']}: {exc}", file=sys.stderr, flush=True)
+    return failures
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -243,6 +441,8 @@ def main(argv: list[str] | None = None) -> int:
             if total == 0 and not args.retry_failed:
                 raise ValueError("Source file contains no gallery or photo URLs")
             print(f"{total} source(s); metadata database: {database}; images are downloaded separately", flush=True)
+            if args.refresh and not args.no_comment:
+                reset_selected_comments(db)
             if total:
                 client = GraphQLClient(ENDPOINT, timeout=args.timeout, retries=args.retries,
                                        retry_backoff=args.retry_backoff, delay=args.delay, cookies=args.cookies)
@@ -262,12 +462,23 @@ def main(argv: list[str] | None = None) -> int:
                         db.execute("UPDATE sources SET error=?,updated_at=? WHERE url=?",
                                    (str(exc)[:1000], utc_now(), source["url"]))
                     print(f"ERROR {source['url']}: {exc}", file=sys.stderr, flush=True)
+            if not args.no_comment and client is not None:
+                failures += fetch_selected_comments(db, client, page_size=args.page_size, verbose=args.verbose)
         if args.export_jsonl:
             count = export_jsonl(db, args.export_jsonl)
             print(f"Exported {count} photo(s) to {args.export_jsonl}")
         total_photos = db.execute("SELECT count(*) FROM photos").fetchone()[0]
         incomplete = db.execute("SELECT count(*) FROM sources WHERE complete=0").fetchone()[0]
-        print(f"Saved {total_photos} unique photo(s); {incomplete} incomplete source(s); {failures} error(s).")
+        if args.no_comment:
+            comment_clause = "comments skipped"
+        else:
+            total_comments = db.execute("SELECT count(*) FROM comments").fetchone()[0]
+            incomplete_comments = db.execute(
+                "SELECT count(*) FROM comment_fetches WHERE complete=0").fetchone()[0]
+            comment_clause = (f"{total_comments} comment(s); "
+                              f"{incomplete_comments} photo(s) with incomplete comments")
+        print(f"Saved {total_photos} unique photo(s); {comment_clause}; "
+              f"{incomplete} incomplete source(s); {failures} error(s).")
         return 1 if failures else 0
     except KeyboardInterrupt:
         print("Interrupted. Committed pages are saved; rerun the same command to resume.", file=sys.stderr)
