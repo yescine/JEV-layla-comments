@@ -50,6 +50,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Minimum seconds between GraphQL requests")
     parser.add_argument("--no-comment", action="store_true",
                         help="Skip photo comments. Comments are fetched by default.")
+    parser.add_argument("--comments-only", action="store_true",
+                        help="Fetch comments for photos already saved from the selected sources. "
+                             "Do not request gallery or photo metadata.")
     parser.add_argument("--cookies", type=Path, help="Optional explicitly exported Netscape cookie file")
     parser.add_argument("--export-jsonl", type=Path,
                         help="Stream all saved photo metadata to this file after fetching")
@@ -420,6 +423,14 @@ def main(argv: list[str] | None = None) -> int:
     database = args.database or (args.output_folder / "photos.sqlite3" if args.output_folder else DEFAULT_DATABASE)
     if args.retry_failed and args.refresh:
         parser.error("--retry-failed resumes saved checkpoints and cannot be combined with --refresh")
+    if args.comments_only and args.no_comment:
+        parser.error("--comments-only and --no-comment cannot be combined")
+    if args.comments_only and args.refresh:
+        parser.error("--comments-only does not refetch metadata and cannot be combined with --refresh")
+    if args.comments_only and args.export_only:
+        parser.error("--comments-only cannot be combined with --export-only")
+    if args.comments_only and not database.is_file():
+        parser.error(f"Database does not exist: {database}")
     if args.export_only and (not args.export_jsonl or args.input or args.url or args.refresh or args.retry_failed):
         parser.error("--export-only requires --export-jsonl and cannot be combined with sources or --refresh")
     if (args.export_only or args.retry_failed) and not database.is_file():
@@ -440,28 +451,33 @@ def main(argv: list[str] | None = None) -> int:
                 total = register_sources(db, source_input, args.refresh)
             if total == 0 and not args.retry_failed:
                 raise ValueError("Source file contains no gallery or photo URLs")
-            print(f"{total} source(s); metadata database: {database}; images are downloaded separately", flush=True)
+            if args.comments_only:
+                print(f"{total} source(s); comments only; database: {database}; "
+                      "photo metadata is not requested", flush=True)
+            else:
+                print(f"{total} source(s); metadata database: {database}; images are downloaded separately", flush=True)
             if args.refresh and not args.no_comment:
                 reset_selected_comments(db)
             if total:
                 client = GraphQLClient(ENDPOINT, timeout=args.timeout, retries=args.retries,
                                        retry_backoff=args.retry_backoff, delay=args.delay, cookies=args.cookies)
-            last_url = ""
-            while True:
-                source = db.execute("SELECT s.* FROM sources s JOIN selected_sources sel ON s.url=sel.url "
-                                    "WHERE s.url>? ORDER BY s.url LIMIT 1", (last_url,)).fetchone()
-                if source is None:
-                    break
-                last_url = source["url"]
-                try:
-                    fetch_source(db, client, source, page_size=args.page_size, max_pages=args.max_pages,
-                                 image_size=args.image_size, verbose=args.verbose)
-                except (GraphQLError, ValueError, requests.RequestException) as exc:
-                    failures += 1
-                    with db:
-                        db.execute("UPDATE sources SET error=?,updated_at=? WHERE url=?",
-                                   (str(exc)[:1000], utc_now(), source["url"]))
-                    print(f"ERROR {source['url']}: {exc}", file=sys.stderr, flush=True)
+            if not args.comments_only:
+                last_url = ""
+                while True:
+                    source = db.execute("SELECT s.* FROM sources s JOIN selected_sources sel ON s.url=sel.url "
+                                        "WHERE s.url>? ORDER BY s.url LIMIT 1", (last_url,)).fetchone()
+                    if source is None:
+                        break
+                    last_url = source["url"]
+                    try:
+                        fetch_source(db, client, source, page_size=args.page_size, max_pages=args.max_pages,
+                                     image_size=args.image_size, verbose=args.verbose)
+                    except (GraphQLError, ValueError, requests.RequestException) as exc:
+                        failures += 1
+                        with db:
+                            db.execute("UPDATE sources SET error=?,updated_at=? WHERE url=?",
+                                       (str(exc)[:1000], utc_now(), source["url"]))
+                        print(f"ERROR {source['url']}: {exc}", file=sys.stderr, flush=True)
             if not args.no_comment and client is not None:
                 failures += fetch_selected_comments(db, client, page_size=args.page_size, verbose=args.verbose)
         if args.export_jsonl:
