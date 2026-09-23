@@ -8,11 +8,18 @@ Each comment is one forward pass. The questions are spam, toxic, harassment, thr
 about_this_photo, specific, and critique. A rerun skips a comment when its text and
 schema version are already scored without an error.
 
+Laya's published figure is about 35 ms per question on a Tesla T4. The script prints
+the milliseconds this machine actually takes. On a GPU with too little memory for the
+float32 checkpoint, the weights are stored as float16 so the forward pass stays on
+the card instead of spilling into shared memory.
+
 --json-verbose writes {database}.scores.json beside the database, with every photo in that file.
 
-Install the model extra before the first real run:
+Install one backend before the first real run. `cpu` and `score` are the same CPU build.
+`cu130` is the CUDA 13.0 build, for a GPU that can hold the checkpoint:
 
-    uv sync --extra score
+    uv sync --extra cpu
+    uv sync --extra cu130
 """
 
 from __future__ import annotations
@@ -24,6 +31,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 try:
@@ -384,6 +392,39 @@ def export_score_json(db: sqlite3.Connection, database: Path) -> Path:
     return path
 
 
+def fit_cuda_weights(agent) -> str:
+    """Store CUDA weights as float16 when the float32 checkpoint cannot fit.
+
+    ModernBERT-large is about 1.6 GiB in float32. On a 2 GiB card the forward
+    then spills into shared system memory and runs no faster than the CPU.
+    Float16 weights are about 0.8 GiB. The runtime already computes in float16
+    on pre-Ampere GPUs, and the scores stay within a few thousandths.
+    """
+    import torch
+
+    param = next(agent.model.parameters())
+    if agent.device.type != "cuda" or param.dtype == torch.float16:
+        return str(param.dtype).removeprefix("torch.")
+    total = torch.cuda.get_device_properties(agent.device).total_memory
+    weight_bytes = sum(p.numel() * p.element_size() for p in agent.model.parameters())
+    # The forward peaked about 0.7 GiB above the weights on this checkpoint.
+    if weight_bytes + 768 * 1024**2 <= int(total * 0.9):
+        return "float32"
+    agent.model.half()
+    torch.cuda.empty_cache()
+    return "float16"
+
+
+def describe_agent(agent) -> str:
+    import torch
+
+    kind = str(next(agent.model.parameters()).dtype).removeprefix("torch.")
+    if agent.device.type == "cuda" and torch.cuda.is_available():
+        name = torch.cuda.get_device_name(agent.device)
+        return f"{name} ({kind})"
+    return f"{agent.device.type} ({kind})"
+
+
 def load_router(device: str | None):
     try:
         from laya import Router
@@ -393,20 +434,24 @@ def load_router(device: str | None):
         ) from exc
     print("Loading Laya english and multilingual checkpoints...", flush=True)
     router = Router(device=device, max_loaded=2)
-    router.preload(["english", "multilingual"])
-    loaded = ", ".join(router.loaded) or "none"
-    print(f"Laya ready ({loaded}).", flush=True)
+    # Shrink after each load. Preload would allocate the second checkpoint
+    # while the first still holds its float32 weights.
+    for name in ("english", "multilingual"):
+        fit_cuda_weights(router.load(name))
+    print(f"Laya ready: {', '.join(f'{name} on {describe_agent(router.load(name))}' for name in router.loaded)}.",
+          flush=True)
     return router
 
 
 def score_pending(db: sqlite3.Connection, *, photo_id: str | None, limit: int, dry_run: bool,
-                  device: str | None, verbose: int, router=None) -> tuple[int, int, int]:
-    """Score comments that are not current. Returns scored, skipped, errors.
+                  device: str | None, verbose: int, router=None) -> tuple[int, int, int, float]:
+    """Score comments that are not current. Returns scored, skipped, errors, inference seconds.
 
     `router` is the Laya Router. When it is omitted, the checkpoints load on the first
     comment that contains words.
     """
     scored = skipped = errors = 0
+    infer_s = 0.0
     shown_state = False
     # Finish the read before writing scores. One connection cannot keep this
     # SELECT open across the inserts.
@@ -429,7 +474,13 @@ def score_pending(db: sqlite3.Connection, *, photo_id: str | None, limit: int, d
         if router is None:
             router = load_router(device)
         try:
-            result = router.predict(state, QUESTIONS)
+            decision = router.route(state, QUESTIONS)
+            agent = router.load(decision["model"])
+            fit_cuda_weights(agent)
+            started = time.perf_counter()
+            result = agent.system_one(state, QUESTIONS)
+            infer_s += time.perf_counter() - started
+            result["routing"] = dict(decision)
         except Exception as exc:
             errors += 1
             save_score(db, row["id"], row["content"], "error", {"error": str(exc)[:1000]}, str(exc)[:1000])
@@ -444,9 +495,11 @@ def score_pending(db: sqlite3.Connection, *, photo_id: str | None, limit: int, d
             "usage": result.get("usage"),
         }, None)
         scored += 1
-        if verbose or scored % 25 == 0:
-            print(f"{row['photo_id']} {row['id']}: {model} {answer_summary(answers)}", flush=True)
-    return scored, skipped, errors
+        if verbose or scored == 1 or scored % 25 == 0:
+            each = infer_s / scored * 1000
+            print(f"{row['photo_id']} {row['id']}: {model} {answer_summary(answers)}  {each:.0f} ms/comment",
+                  flush=True)
+    return scored, skipped, errors, infer_s
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -470,12 +523,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Removed {removed} saved score(s).", flush=True)
         scope = f"photo {args.photo}" if args.photo else "all photos"
         print(f"Schema {SCHEMA_VERSION}; {scope}; database: {database}", flush=True)
-        scored, skipped, errors = score_pending(
+        scored, skipped, errors, infer_s = score_pending(
             db, photo_id=args.photo, limit=args.limit, dry_run=args.dry_run,
             device=None if args.device == "auto" else args.device, verbose=args.verbose,
         )
         verb = "Would score" if args.dry_run else "Scored"
         print(f"{verb} {scored} comment(s); skipped {skipped} with no words; {errors} error(s).")
+        if scored and not args.dry_run:
+            print(f"Inference averaged {infer_s / scored * 1000:.0f} ms/comment "
+                  f"({infer_s:.1f}s of model time).")
         if args.json_verbose:
             path = export_score_json(db, database)
             print(f"Wrote {path}")

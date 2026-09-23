@@ -8,7 +8,42 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-score = ["laya>=0.3.5"]
+# CPU wheels. This is the one to install when the GPU has too little memory for the
+# checkpoint: a 2 GB card spills into shared memory and loses to the CPU.
+cpu = ["laya>=0.3.5", "torch>=2.14.0"]
+score = ["laya>=0.3.5", "torch>=2.14.0"]
+# CUDA 13.0 wheels (Linux and Windows). Needs a driver that supports CUDA 13 and a
+# card with enough memory to hold the checkpoint.
+cu130 = ["laya>=0.3.5", "torch>=2.14.0"]
+
+[tool.uv]
+conflicts = [
+    [
+        { extra = "cpu" },
+        { extra = "cu130" },
+    ],
+    [
+        { extra = "score" },
+        { extra = "cu130" },
+    ],
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", extra = "cpu" },
+    { index = "pytorch-cpu", extra = "score" },
+    { index = "pytorch-cu130", extra = "cu130" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
 
 [project.scripts]
 fivehundredpx-fetch = "fivehundredpx.fivehundredpx_fetch:main"
