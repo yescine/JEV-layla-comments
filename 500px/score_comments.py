@@ -43,51 +43,40 @@ except ImportError:
     from common import DEFAULT_DATABASE, non_negative_int, open_database, utc_now
 
 
-SCHEMA_VERSION = "1"
+SCHEMA_VERSION = "2"
 
 # Bump SCHEMA_VERSION when these questions change. Stored scores stay valid for their version.
 # --overwrite rescores without a version bump when this definition changes.
+# `impact` prints 0 through 5. Laya's score is the expected index of `criteria`,
+# so six anchors is the top of that scale. Eleven anchors (0 through 10) are too fine.
 QUESTIONS = {
-    # "spam": {
-    #     "type": "noul",
-    #     "instructions": "Is `comment` spam or advertising?",
-    # },
-    # "toxic": {
-    #     "type": "noul",
-    #     "instructions": "Is `comment` toxic: rude, insulting, or likely to make someone leave?",
-    # },
-    # "harassment": {
-    #     "type": "noul",
-    #     "instructions": "Does `comment` harass a specific person?",
-    # },
-    # "threat": {
-    #     "type": "noul",
-    #     "instructions": "Does `comment` threaten violence, harm, or intimidation?",
-    # },
-    # "about_this_photo": {
-    #     "type": "noul",
-    #     "instructions": (
-    #         "Does `comment` discuss this photo's subject, technique, or place, using "
-    #         "`photo_title`, `photo_description`, `category`, `subject`, `style`, `keywords`, "
-    #         "and `place`? When `is_reply` is true, the comment may instead address another comment."
-    #     ),
-    # },
-    # "specific": {
-    #     "type": "noul",
-    #     "instructions": (
-    #         "Does `comment` name something visible or technical, such as light, composition, "
-    #         "color, lens, location, or the subject, rather than only generic praise?"
-    #     ),
-    # },
-    "critique": {
+    "impact": {
         "type": "score",
-        "instructions": "How substantive is `comment` as a response to this photo?",
+        "instructions": (
+            "How hard did this photo hit the person who wrote `comment`? "
+            "A comment already shows interest in the subject. Score the force of the reaction: "
+            "awe, shock, desire, a long outpouring, sexual or NSFW wording, or a brutal expression. "
+            "Use `photo_title`, `photo_description`, `category`, `subject`, `style`, `keywords`, "
+            "and `place` only to see what those words are reacting to. "
+            "Polite or technical remarks stay low. Profanity, sexual wording, and extreme language "
+            "used as praise or shock stay high."
+        ),
         "criteria": [
-            "reaction only, or nothing about the photo",
-            "generic praise or thanks",
-            "a specific observation",
-            "a useful critique of subject, technique, or composition",
+            "no feeling about the photo, or the words are not about it",
+            "short polite praise, thanks, or an emoji",
+            "names the subject, place, light, or a mild feeling",
+            "moved: awe, longing, a memory, or a personal story",
+            "hit hard: intense language, profanity, or a long outpouring",
+            "overwhelmed: sexual, NSFW, or brutal wording because the image wrecked them",
         ],
+    },
+    "raw": {
+        "type": "noul",
+        "instructions": (
+            "Does `comment` use sexual, NSFW, profane, or brutal wording as a reaction to this photo? "
+            "Count desire, shock, and awe. A long sincere comment without that wording is false. "
+            "An insult aimed at a person, with no reaction to the image, is false."
+        ),
     },
 }
 
