@@ -15,8 +15,9 @@ the milliseconds this machine actually takes. On a GPU with too little memory fo
 float32 checkpoint, the weights are stored as float16 so the forward pass stays on
 the card instead of spilling into shared memory.
 
---json-verbose writes {database}.scores.jsonl beside the database, one comment per line:
-photo id, comment id, model, each question score, then the comment text.
+--json-verbose replaces {database}.scores.jsonl beside the database, then appends one
+comment per line as it is scored: photo id, comment id, model, each question score,
+then the comment text. The file can be read before the run finishes.
 
 Install one backend before the first real run. `cpu` and `score` are the same CPU build.
 `cu130` is the CUDA 13.0 build, for a GPU that can hold the checkpoint:
@@ -33,7 +34,6 @@ import json
 import os
 import sqlite3
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -102,8 +102,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true",
                         help="Count comments that would be scored without loading Laya")
     parser.add_argument("--json-verbose", action="store_true",
-                        help="Write {database}.scores.jsonl beside the database, one comment per line, "
-                             "with each question score and the comment text")
+                        help="Replace {database}.scores.jsonl and append one comment per line as it is "
+                             "scored, so a long run can be read before it finishes")
     parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto",
                         help="Torch device for the checkpoints (default: auto)")
     parser.add_argument("-v", "--verbose", action="count", default=0)
@@ -304,32 +304,56 @@ def comment_line(row: sqlite3.Row) -> dict:
     return line
 
 
-def export_score_jsonl(db: sqlite3.Connection, database: Path) -> Path:
-    """Write one JSON line per comment beside the database."""
-    path = scores_path(database)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    rows = db.execute("""
-        SELECT p.id AS photo_id, c.id AS comment_id, c.parent_id, c.content,
-               s.model, s.answers_json, s.error
-        FROM comments c
-        JOIN photos p ON p.id = c.photo_id
-        LEFT JOIN comment_scores s ON s.comment_id = c.id
-        ORDER BY p.id, c.created_at, c.id
-    """)
-    temp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
-                                         prefix=path.name + ".", suffix=".part", delete=False) as out:
-            temp_path = Path(out.name)
-            for row in rows:
-                out.write(json.dumps(comment_line(row), ensure_ascii=False) + "\n")
-            out.flush()
-            os.fsync(out.fileno())
-        os.replace(temp_path, path)
-    finally:
-        if temp_path and temp_path.exists():
-            temp_path.unlink()
-    return path
+class ScoreJsonl:
+    """Fresh JSONL file. Already-scored comments are copied, then each new score is appended."""
+
+    def __init__(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
+        self._file = path.open("w", encoding="utf-8", newline="\n")
+
+    def write_row(self, row) -> None:
+        self._file.write(json.dumps(comment_line(row), ensure_ascii=False) + "\n")
+        self._file.flush()
+
+    def write_saved(self, db: sqlite3.Connection, overwrite: bool) -> int:
+        """Copy scores this run will keep. Stale rows are left out when overwrite is set."""
+        rows = db.execute("""
+            SELECT p.id AS photo_id, c.id AS comment_id, c.parent_id, c.content,
+                   s.model, s.answers_json, s.error
+            FROM comments c
+            JOIN photos p ON p.id = c.photo_id
+            JOIN comment_scores s ON s.comment_id = c.id
+            WHERE s.schema_version = ?
+              AND s.error IS NULL
+              AND s.content_hash = sha256(c.content)
+              AND (? = 0 OR json_extract(s.answers_json, '$.questions_sha256') = ?)
+            ORDER BY p.id, c.created_at, c.id
+        """, (SCHEMA_VERSION, int(overwrite), questions_fingerprint()))
+        count = 0
+        for row in rows:
+            self.write_row(row)
+            count += 1
+        return count
+
+    def write_scored(self, row, model: str, answers: dict, error: str | None) -> None:
+        self.write_row({
+            "photo_id": row["photo_id"],
+            "comment_id": row["id"],
+            "parent_id": row["parent_id"],
+            "content": row["content"],
+            "model": model,
+            "answers_json": json.dumps(answers, ensure_ascii=False, default=str),
+            "error": error,
+        })
+
+    def close(self) -> None:
+        if self._file is None:
+            return
+        self._file.flush()
+        os.fsync(self._file.fileno())
+        self._file.close()
+        self._file = None
 
 
 def fit_cuda_weights(agent) -> str:
@@ -384,7 +408,8 @@ def load_router(device: str | None):
 
 
 def score_pending(db: sqlite3.Connection, *, photo_id: str | None, limit: int, dry_run: bool,
-                  overwrite: bool, device: str | None, verbose: int, router=None) -> tuple[int, int, int, float]:
+                  overwrite: bool, device: str | None, verbose: int, router=None,
+                  jsonl: ScoreJsonl | None = None) -> tuple[int, int, int, float]:
     """Score comments that are not current. Returns scored, skipped, errors, inference seconds.
 
     `router` is the Laya Router. When it is omitted, the checkpoints load on the first
@@ -399,6 +424,8 @@ def score_pending(db: sqlite3.Connection, *, photo_id: str | None, limit: int, d
         if not has_words(row["content"]):
             if not dry_run:
                 save_score(db, row["id"], row["content"], "skipped", {"skipped": "no_words"}, None)
+                if jsonl is not None:
+                    jsonl.write_scored(row, "skipped", {"skipped": "no_words"}, None)
             skipped += 1
             if verbose:
                 print(f"{row['id']}: skipped, no words", flush=True)
@@ -423,17 +450,23 @@ def score_pending(db: sqlite3.Connection, *, photo_id: str | None, limit: int, d
             result["routing"] = dict(decision)
         except Exception as exc:
             errors += 1
-            save_score(db, row["id"], row["content"], "error", {"error": str(exc)[:1000]}, str(exc)[:1000])
+            message = str(exc)[:1000]
+            save_score(db, row["id"], row["content"], "error", {"error": message}, message)
+            if jsonl is not None:
+                jsonl.write_scored(row, "error", {"error": message}, message)
             print(f"ERROR {row['id']}: {exc}", file=sys.stderr, flush=True)
             continue
         answers = result.get("answers") if isinstance(result.get("answers"), dict) else {}
         routing = result.get("routing") if isinstance(result.get("routing"), dict) else {}
         model = routing.get("model") if isinstance(routing.get("model"), str) else "unknown"
-        save_score(db, row["id"], row["content"], model, {
+        payload = {
             "answers": answers,
             "routing": routing,
             "usage": result.get("usage"),
-        }, None)
+        }
+        save_score(db, row["id"], row["content"], model, payload, None)
+        if jsonl is not None:
+            jsonl.write_scored(row, model, payload, None)
         scored += 1
         if verbose or scored == 1 or scored % 25 == 0:
             each = infer_s / scored * 1000
@@ -452,6 +485,7 @@ def main(argv: list[str] | None = None) -> int:
     if not database.is_file():
         parser.error(f"Database does not exist: {database}")
     db = None
+    jsonl = None
     try:
         db = open_database(database)
         attach_hash(db)
@@ -465,27 +499,28 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Schema {SCHEMA_VERSION}; {scope}; database: {database}", flush=True)
         if args.overwrite:
             print("Overwrite: replacing answers_json that does not match the current questions.", flush=True)
+        if args.json_verbose and not args.dry_run:
+            jsonl = ScoreJsonl(scores_path(database))
+            print(f"Streaming {jsonl.path}", flush=True)
+            copied = jsonl.write_saved(db, args.overwrite)
+            if copied:
+                print(f"Copied {copied} saved comment(s); new scores append as they finish.", flush=True)
         scored, skipped, errors, infer_s = score_pending(
             db, photo_id=args.photo, limit=args.limit, dry_run=args.dry_run,
             overwrite=args.overwrite, device=None if args.device == "auto" else args.device,
-            verbose=args.verbose,
+            verbose=args.verbose, jsonl=jsonl,
         )
         verb = "Would score" if args.dry_run else "Scored"
         print(f"{verb} {scored} comment(s); skipped {skipped} with no words; {errors} error(s).")
         if scored and not args.dry_run:
             print(f"Inference averaged {infer_s / scored * 1000:.0f} ms/comment "
                   f"({infer_s:.1f}s of model time).")
-        if args.json_verbose:
-            path = export_score_jsonl(db, database)
-            print(f"Wrote {path}")
+        if jsonl is not None:
+            print(f"Wrote {jsonl.path}")
         return 1 if errors else 0
     except KeyboardInterrupt:
-        if args.json_verbose and db is not None:
-            try:
-                path = export_score_jsonl(db, database)
-                print(f"Wrote {path}", file=sys.stderr)
-            except (OSError, sqlite3.Error, ValueError) as exc:
-                print(f"ERROR writing score file: {exc}", file=sys.stderr)
+        if jsonl is not None:
+            print(f"Scores so far are in {jsonl.path}", file=sys.stderr)
         print("Interrupted. Saved scores are kept; rerun the same command to resume.", file=sys.stderr)
         return 130
     except ModelLoadError as exc:
@@ -495,6 +530,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     finally:
+        if jsonl is not None:
+            jsonl.close()
         if db is not None:
             db.close()
 
